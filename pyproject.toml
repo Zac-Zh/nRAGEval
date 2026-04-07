@@ -1,0 +1,139 @@
+你是一个【数值与条款精确度审查员】。你的任务是提取 response 中的所有"硬事实"（数值、日期、金额、期限、百分比、条款编号、标准号、名称等），并与 contexts 中的对应原文逐条比对。
+
+## 硬事实的定义
+
+符合以下任一模式的内容：
+- 数字 + 量词（如"5年"、"60个工作日"、"15万元"、"1万元以上"）
+- 日期（如"1985年"、"2021年6月1日"）
+- 百分比
+- 条款编号（如"第二十二条"、"第三章"）
+- 标准号（如"GB18279"、"WS/T 548-2017"、"ISO 12052"）
+- 专有名称（如"ACR-NEMA"、"国务院药品监督管理部门"）
+- 版本号（如"DICOM 3.0"、"YY0505-2012"）
+
+## 比对规则
+
+对每个硬事实，比对 response vs contexts：
+
+- **match_exact**：完全一致（含语义等价，如"5年"="60个月"）
+- **match_semantic**：语义等价但表述不同（如"五年"="5年"）
+- **mismatch**：数值/日期/编号不一致（严重失败）
+- **not_in_context**：response 中有此事实，contexts 中查不到（交给 KBC，NCP 不扣分也不加分，标记为 N/A）
+
+注意：
+1. "5年" 和 "60个月" 必须判为 `match_semantic`（语义等价）。
+2. "1万元" 和 "10000元" 判为 `match_semantic`。
+3. "1万元" 和 "10万元" 判为 `mismatch`（数量级错误，严重）。
+4. "1985年" 和 "1988年" 判为 `mismatch`。
+5. "第二十二条" 和 "第22条" 判为 `match_semantic`。
+6. 只在 response 中出现、contexts 没有的硬事实，标记 `not_in_context`，不计入 NCP 分子分母。
+
+## 评分公式
+
+```
+NCP = (match_exact + match_semantic) / (match_exact + match_semantic + mismatch)
+```
+
+如果 response 中没有硬事实，或所有硬事实都 `not_in_context`，NCP = None（N/A）。
+
+## Few-shot examples
+
+### 示例 1（DOC-1 Q05 风格）
+
+Response: "违法生产经营货值金额不足1万元的，并处5万元以上15万元以下罚款。"
+
+Contexts: "...货值金额不足1万元的，并处5万元以上15万元以下罚款；货值金额1万元以上的，并处货值金额15倍以上30倍以下罚款..."
+
+输出:
+```json
+{
+  "facts": [
+    {"fact": "1万元", "context_value": "1万元", "status": "match_exact"},
+    {"fact": "5万元以上", "context_value": "5万元以上", "status": "match_exact"},
+    {"fact": "15万元以下", "context_value": "15万元以下", "status": "match_exact"}
+  ],
+  "score": 1.0
+}
+```
+
+### 示例 2（NCP mismatch）
+
+Response: "医疗器械注册证有效期为3年。"
+
+Contexts: "...第二十二条 医疗器械注册证有效期为5年..."
+
+输出:
+```json
+{
+  "facts": [
+    {"fact": "3年", "context_value": "5年", "status": "mismatch"}
+  ],
+  "score": 0.0
+}
+```
+
+### 示例 3（语义等价）
+
+Response: "医疗器械注册证有效期为60个月。"
+
+Contexts: "...有效期为5年..."
+
+输出:
+```json
+{
+  "facts": [
+    {"fact": "60个月", "context_value": "5年", "status": "match_semantic"}
+  ],
+  "score": 1.0
+}
+```
+
+### 示例 4（not_in_context，来自 DOC-2 Q09 越界）
+
+Response: "DICOM 的最新版本是 3.0，该版本于 1993 年发布。"
+
+Contexts: "...1993年发布的DICOM标准3.0..."
+
+输出:
+```json
+{
+  "facts": [
+    {"fact": "3.0", "context_value": "3.0", "status": "match_exact"},
+    {"fact": "1993年", "context_value": "1993年", "status": "match_exact"}
+  ],
+  "score": 1.0,
+  "note": "所有硬事实都能在 contexts 找到，NCP=1.0。但'最新'这一时间限定越界由 KBC 负责。"
+}
+```
+
+### 示例 5（无数值）
+
+Response: "原则上应在原检验机构进行。"
+
+输出:
+```json
+{
+  "facts": [],
+  "score": null,
+  "note": "response 中无硬事实"
+}
+```
+
+## 输出格式
+
+```json
+{
+  "facts": [{"fact": "", "context_value": "", "status": ""}, ...],
+  "score": 0.0-1.0 或 null,
+  "note": "可选说明"
+}
+```
+
+## 你的任务
+
+Response: {answer}
+
+Contexts:
+{contexts}
+
+只输出 JSON。

@@ -1,0 +1,189 @@
+"""场景化及格线预设 + baseline 对比
+
+阈值依据：
+- 基于阶段一 30 条中文样本的实测数据（见 phase2_metric_design.md §5.2）
+- 结合"来源合法性优先于答案正确性"的设计哲学
+- 关键指标（critical）= 不达标直接红灯；参考指标（reference）= 参考用途，不红灯
+- 待更多真实场景数据校准后迭代
+"""
+from typing import Optional
+
+
+SCENE_PRESETS = {
+    "policy": {
+        "name": "政策法规",
+        "description": "政策、法规、合同、合规审查场景。一条越界信息可能导致法律误读，零容错。",
+        "thresholds": {
+            # KBC 极严：不允许模型记忆混入（政策解读必须字字有据）
+            "kbc": {"level": "critical", "min": 0.95},
+            # RA 严格：没答案就必须拒答，编造政策条文后果严重
+            "ra":  {"level": "critical", "min": 1.0},
+            # NCP 零容错：金额/期限/条款编号一错全错
+            "ncp": {"level": "critical", "min": 1.0},
+            # CT 参考：应指出条款出处但不强制每句都标注
+            "ct":  {"level": "reference", "min": 0.7},
+            # AC 参考：覆盖主要要点即可，不要求穷尽
+            "ac":  {"level": "reference", "min": 0.8},
+        },
+    },
+    "technical": {
+        "name": "技术手册",
+        "description": "技术文档、API 手册、运维手册场景。参数/命令/版本号的精确性是硬需求；回答不完整可能导致操作失败。",
+        "thresholds": {
+            "kbc": {"level": "critical", "min": 0.90},
+            "ra":  {"level": "critical", "min": 1.0},
+            "ncp": {"level": "critical", "min": 0.95},
+            "ct":  {"level": "reference", "min": 0.5},
+            # AC 是关键：技术问题的遗漏可能导致操作失败
+            "ac":  {"level": "critical", "min": 0.85},
+        },
+    },
+    "faq": {
+        "name": "FAQ / 客服",
+        "description": "FAQ、客服、产品问答场景。容忍适度的语言润色；AC 是关键（问三答一体验极差）；RA 可适度宽松。",
+        "thresholds": {
+            "kbc": {"level": "critical", "min": 0.85},
+            "ra":  {"level": "reference", "min": 0.8},
+            "ncp": {"level": "reference", "min": 0.9},
+            "ct":  {"level": "reference", "min": 0.3},
+            "ac":  {"level": "critical", "min": 0.9},
+        },
+    },
+}
+
+
+METRIC_LABELS = {
+    "kbc": "知识边界合规",
+    "ra": "拒答合理性",
+    "ct": "引用可追溯性",
+    "ncp": "数值/条款精确度",
+    "ac": "回答完整性",
+}
+
+
+def evaluate_against_preset(scores: dict, scene: str) -> dict:
+    """
+    用场景预设判定 scores 的达标情况。
+
+    Args:
+        scores: {"kbc": 0.92, "ra": 1.0, ...} 平均分字典
+        scene: "policy" / "technical" / "faq"
+
+    Returns:
+        {
+            "scene": "policy",
+            "scene_name": "政策法规",
+            "overall_pass": False,
+            "details": {"kbc": {"score", "threshold", "level", "status"}, ...},
+            "critical_failures": ["kbc"],
+            "signal": "red"  # red / yellow / green（green 需结合 baseline 对比才能确定）
+        }
+    """
+    if scene not in SCENE_PRESETS:
+        raise ValueError(f"Unknown scene: {scene}. Valid: {list(SCENE_PRESETS.keys())}")
+
+    preset = SCENE_PRESETS[scene]
+    details = {}
+    critical_failures = []
+
+    for metric, cfg in preset["thresholds"].items():
+        score = scores.get(metric)
+        threshold = cfg["min"]
+        level = cfg["level"]
+        if score is None:
+            status = "n/a"
+        elif score >= threshold:
+            status = "pass"
+        else:
+            status = "fail"
+            if level == "critical":
+                critical_failures.append(metric)
+        details[metric] = {
+            "score": score,
+            "threshold": threshold,
+            "level": level,
+            "status": status,
+        }
+
+    overall_pass = len(critical_failures) == 0
+    # signal 初步：红/绿。黄需要 baseline 对比才能确定（在 compare_with_baseline 中进一步判断）
+    signal = "red" if critical_failures else "green"
+
+    return {
+        "scene": scene,
+        "scene_name": preset["name"],
+        "scene_description": preset["description"],
+        "overall_pass": overall_pass,
+        "details": details,
+        "critical_failures": critical_failures,
+        "signal": signal,
+    }
+
+
+def compare_with_baseline(scores: dict, baseline: dict) -> dict:
+    """
+    将 scores 与 baseline 对比。
+
+    baseline 格式：{"overall": {"kbc": 0.87, ...}, ...} 或直接 {"kbc": 0.87, ...}
+
+    Returns:
+        {
+            "kbc": {"score": 0.92, "baseline": 0.87, "diff": +0.05, "better": True},
+            ...
+            "summary": "在 KBC/NCP 上优于 baseline，在 CT 上有提升空间"
+        }
+    """
+    # 兼容两种 baseline 格式
+    bl = baseline.get("overall", baseline) if isinstance(baseline, dict) else {}
+
+    result = {}
+    better_metrics = []
+    worse_metrics = []
+
+    for metric in ["kbc", "ra", "ct", "ncp", "ac"]:
+        s = scores.get(metric)
+        b = bl.get(metric)
+        if s is None or b is None:
+            result[metric] = {"score": s, "baseline": b, "diff": None, "better": None}
+            continue
+        diff = round(s - b, 4)
+        better = diff >= 0
+        result[metric] = {
+            "score": s,
+            "baseline": b,
+            "diff": diff,
+            "better": better,
+        }
+        # 只有明显优于或明显劣于（diff > 0.02）才纳入摘要
+        if diff > 0.02:
+            better_metrics.append(metric.upper())
+        elif diff < -0.02:
+            worse_metrics.append(metric.upper())
+
+    # 摘要
+    parts = []
+    if better_metrics:
+        parts.append(f"您的系统在 {'/'.join(better_metrics)} 上优于 naive baseline")
+    if worse_metrics:
+        parts.append(f"在 {'/'.join(worse_metrics)} 上有提升空间")
+    if not parts:
+        parts.append("整体与 naive baseline 持平")
+
+    result["summary"] = "，".join(parts) + "。"
+    result["any_worse"] = bool(worse_metrics)
+    return result
+
+
+def determine_signal(preset_result: dict, baseline_compare: Optional[dict]) -> str:
+    """
+    综合 preset 达标 + baseline 对比确定三色信号灯。
+
+    🟢 green:  关键指标全达标 + 所有指标 ≥ baseline
+    🟡 yellow: 关键指标全达标，但部分指标 < baseline
+    🔴 red:    存在关键指标未达标
+    """
+    if not preset_result["overall_pass"]:
+        return "red"
+    if baseline_compare and baseline_compare.get("any_worse"):
+        return "yellow"
+    return "green"

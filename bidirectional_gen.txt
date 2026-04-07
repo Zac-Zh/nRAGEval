@@ -1,0 +1,38 @@
+"""Numerical & Clause Precision (NCP) — 数值/条款精确度"""
+from ..judge.base import BaseJudge
+from ..schemas import EvalSample
+
+
+def evaluate_ncp(sample: EvalSample, judge: BaseJudge) -> dict:
+    """
+    评估 NCP:
+    从 response 中提取硬事实（数值、日期、编号），与 contexts 比对。
+    语义等价（5年 vs 60个月）计为 match_semantic。
+    NCP = (exact + semantic) / (exact + semantic + mismatch)
+    not_in_context 的 fact 交给 KBC，不计入 NCP 分母。
+    """
+    prompt_template = BaseJudge.load_prompt("ncp_rubric")
+    ctx_text = "\n---\n".join(f"[{i+1}] {c}" for i, c in enumerate(sample.contexts))
+    prompt = prompt_template.replace("{answer}", sample.answer).replace("{contexts}", ctx_text)
+
+    result = judge.call_json(prompt)
+    if not isinstance(result, dict):
+        return {"score": None, "error": "judge 返回格式错误"}
+
+    facts = result.get("facts", [])
+    score = result.get("score")
+    if isinstance(score, (int, float)):
+        score = float(score)
+    elif score is None:
+        # 根据 facts 自己计算
+        exact = sum(1 for f in facts if f.get("status") == "match_exact")
+        semantic = sum(1 for f in facts if f.get("status") == "match_semantic")
+        mismatch = sum(1 for f in facts if f.get("status") == "mismatch")
+        denom = exact + semantic + mismatch
+        score = round((exact + semantic) / denom, 4) if denom > 0 else None
+
+    return {
+        "score": score,
+        "facts": facts,
+        "note": result.get("note", ""),
+    }

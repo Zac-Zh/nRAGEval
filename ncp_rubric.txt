@@ -1,0 +1,370 @@
+"""HTML 评测报告渲染器 —— 含场景达标判断 + baseline 对比 + 叠加雷达图"""
+import base64
+import io
+import os
+import warnings
+from typing import Optional
+
+from ..schemas import EvalResult
+from ..presets import (
+    SCENE_PRESETS,
+    METRIC_LABELS,
+    evaluate_against_preset,
+    compare_with_baseline,
+    determine_signal,
+)
+
+METRICS = ["kbc", "ra", "ct", "ncp", "ac"]
+
+
+def _compute_aggregates(results: list[EvalResult]) -> dict:
+    """聚合 5 维度平均分，跳过 None 和 low_confidence"""
+    agg = {}
+    for metric in METRICS:
+        vals = [
+            r.scores.get(metric) for r in results
+            if r.scores.get(metric) is not None and r.confidence == "high"
+        ]
+        agg[metric] = round(sum(vals) / len(vals), 4) if vals else None
+    return agg
+
+
+def _detect_cn_font() -> bool:
+    try:
+        import matplotlib.font_manager as fm
+        available = {f.name for f in fm.fontManager.ttflist}
+        return any(cf in available for cf in
+                   ["SimHei", "WenQuanYi Zen Hei", "Microsoft YaHei", "PingFang SC", "Arial Unicode MS"])
+    except Exception:
+        return False
+
+
+def _render_radar(aggregates: dict, baseline: Optional[dict] = None) -> str:
+    """
+    渲染雷达图。若提供 baseline，则叠加绘制：
+      - 实线：用户系统
+      - 虚线：baseline
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        return ""
+
+    labels_cn = [METRIC_LABELS[m] for m in METRICS]
+    has_cn = _detect_cn_font()
+    if has_cn:
+        plt.rcParams["font.sans-serif"] = ["SimHei", "WenQuanYi Zen Hei", "Microsoft YaHei", "DejaVu Sans"]
+        plt.rcParams["axes.unicode_minus"] = False
+        labels = labels_cn
+    else:
+        labels = [m.upper() for m in METRICS]
+    warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
+
+    values = [aggregates.get(m) or 0 for m in METRICS]
+    angles = np.linspace(0, 2 * np.pi, len(METRICS), endpoint=False).tolist()
+    values_plot = values + values[:1]
+    angles_plot = angles + angles[:1]
+
+    fig, ax = plt.subplots(figsize=(6.5, 6.5), subplot_kw=dict(polar=True))
+    ax.plot(angles_plot, values_plot, linewidth=2.2, color="#2c7fb8", label="your system")
+    ax.fill(angles_plot, values_plot, alpha=0.25, color="#2c7fb8")
+
+    if baseline:
+        bl = baseline.get("overall", baseline)
+        bl_values = [bl.get(m) or 0 for m in METRICS]
+        bl_plot = bl_values + bl_values[:1]
+        ax.plot(angles_plot, bl_plot, linewidth=2.0, color="#e67e22",
+                linestyle="--", label="naive baseline")
+        ax.fill(angles_plot, bl_plot, alpha=0.12, color="#e67e22")
+        ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1), fontsize=9)
+
+    ax.set_xticks(angles)
+    ax.set_xticklabels(labels)
+    ax.set_ylim(0, 1)
+    ax.set_yticks([0.2, 0.4, 0.6, 0.8, 1.0])
+    ax.grid(True)
+    title = "5-Dim Eval Radar" if not has_cn else "5 维评测雷达图"
+    ax.set_title(title, pad=20)
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return f'<img src="data:image/png;base64,{base64.b64encode(buf.read()).decode()}" alt="radar" style="max-width:560px;"/>'
+
+
+def _generate_suggestions(aggregates: dict, preset_result: Optional[dict]) -> list[str]:
+    """基于分数 + preset 达标情况给出改进建议"""
+    suggestions = []
+    thresholds = 0.7
+
+    advice = {
+        "kbc": "系统倾向使用模型记忆而非知识库内容。建议在生成 prompt 中强化'严格仅基于提供的上下文回答，不得使用外部知识'的指令；可运行 `nrageval counterfactual` 定量确认越界比例。",
+        "ra":  "系统存在过度回答或过度拒答问题。建议调整拒答阈值与 prompt：明确告知模型在 context 不足时必须拒答，并使用'未提及/未涉及'等标准措辞。",
+        "ct":  "回答缺乏对源文档的显式引用。建议在 prompt 中要求生成端标注来源（如'根据第X条'、'参见 X.Y 节'）；并在检索时保留 chunk 的结构化元数据。",
+        "ncp": "数值/条款引用不精确。建议缩小 chunk_size 以提高关键数值的检索命中率；或在生成 prompt 中明确要求'引用原文数值时必须逐字复制'。",
+        "ac":  "回答不完整，遗漏问题要点。建议增加检索 top-k，或启用 multi-query retrieval；对跨段落问题可在 prompt 中要求'列举全部相关条目'。",
+    }
+
+    # 优先列出 preset 判为 critical_failure 的指标
+    if preset_result:
+        for m in preset_result.get("critical_failures", []):
+            v = aggregates.get(m)
+            threshold = preset_result["details"][m]["threshold"]
+            suggestions.append(f"🔴【关键指标未达标 · {METRIC_LABELS[m]} ({m.upper()})={v} < {threshold}】{advice[m]}")
+
+    # 其他低分但非 critical 的
+    for m in METRICS:
+        v = aggregates.get(m)
+        if v is None or v >= thresholds:
+            continue
+        if preset_result and m in preset_result.get("critical_failures", []):
+            continue  # 已经列过了
+        suggestions.append(f"⚠️【{METRIC_LABELS[m]} ({m.upper()})={v}】{advice[m]}")
+
+    if not suggestions:
+        suggestions.append("✓ 各指标表现良好，未发现需要立即处理的问题。")
+
+    return suggestions
+
+
+def _render_scene_block(preset_result: dict) -> str:
+    """场景达标判断板块"""
+    signal = preset_result["signal"]
+    signal_emoji = {"red": "🔴", "yellow": "🟡", "green": "🟢"}[signal]
+    signal_text = {
+        "red": "存在关键指标未达标",
+        "yellow": "关键指标达标，但部分指标低于 baseline",
+        "green": "关键指标全部达标",
+    }[signal]
+    bg = {"red": "#f8d7da", "yellow": "#fff3cd", "green": "#d4edda"}[signal]
+
+    rows = ""
+    for m in METRICS:
+        d = preset_result["details"].get(m, {})
+        score = d.get("score")
+        thr = d.get("threshold")
+        level = d.get("level", "-")
+        status = d.get("status", "-")
+        level_cn = {"critical": "关键", "reference": "参考"}.get(level, level)
+        status_emoji = {"pass": "✓", "fail": "✗", "n/a": "—"}.get(status, "?")
+        row_bg = "#f8d7da" if status == "fail" and level == "critical" else ("#fff3cd" if status == "fail" else "#ffffff")
+        score_str = f"{score:.3f}" if isinstance(score, (int, float)) else "N/A"
+        rows += f"""<tr style="background:{row_bg};">
+          <td>{METRIC_LABELS[m]} ({m.upper()})</td>
+          <td>{score_str}</td>
+          <td>≥ {thr}</td>
+          <td>{level_cn}</td>
+          <td style="text-align:center;">{status_emoji} {status}</td>
+        </tr>"""
+
+    return f"""<div style="background:{bg};padding:20px;border-radius:8px;margin:16px 0;">
+  <h2 style="border:none;margin:0 0 10px 0;">{signal_emoji} {signal_text}</h2>
+  <p style="margin:4px 0;"><b>场景</b>: {preset_result['scene_name']} ({preset_result['scene']})</p>
+  <p style="margin:4px 0;color:#555;font-size:0.9em;">{preset_result['scene_description']}</p>
+  <table style="margin-top:12px;">
+    <thead><tr><th>指标</th><th>得分</th><th>及格线</th><th>角色</th><th>状态</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+</div>"""
+
+
+def _render_baseline_block(compare: dict) -> str:
+    """baseline 对比板块"""
+    rows = ""
+    for m in METRICS:
+        d = compare.get(m, {})
+        if not isinstance(d, dict):
+            continue
+        s = d.get("score")
+        b = d.get("baseline")
+        diff = d.get("diff")
+        s_str = f"{s:.3f}" if isinstance(s, (int, float)) else "-"
+        b_str = f"{b:.3f}" if isinstance(b, (int, float)) else "-"
+        if diff is None:
+            diff_html = "-"
+        elif diff >= 0:
+            diff_html = f'<span style="color:#28a745;font-weight:bold;">+{diff:.3f}</span>'
+        else:
+            diff_html = f'<span style="color:#dc3545;font-weight:bold;">{diff:.3f}</span>'
+        rows += f"<tr><td>{METRIC_LABELS[m]} ({m.upper()})</td><td>{s_str}</td><td>{b_str}</td><td>{diff_html}</td></tr>"
+
+    summary = compare.get("summary", "")
+    return f"""<h2>三、Baseline 对比</h2>
+<div class="summary-box">{summary}</div>
+<table>
+  <thead><tr><th>指标</th><th>您的系统</th><th>Naive Baseline</th><th>Diff</th></tr></thead>
+  <tbody>{rows}</tbody>
+</table>"""
+
+
+def render_html_report(
+    results: list[EvalResult],
+    output_path: str,
+    scene: Optional[str] = None,
+    baseline: Optional[dict] = None,
+    title: str = "nrageval 评测报告",
+    # legacy alias
+    scenario: Optional[str] = None,
+) -> str:
+    """生成 HTML 报告
+
+    Args:
+        results: 评测结果列表
+        output_path: HTML 输出路径
+        scene: 场景预设名称 ("policy"/"technical"/"faq")。不传则不做达标判断
+        baseline: baseline dict（或含 "overall" 字段的 dict）。不传则不显示对比
+        title: 报告标题
+        scenario: legacy 别名（== scene）
+    """
+    if scene is None and scenario is not None:
+        scene = scenario
+
+    aggregates = _compute_aggregates(results)
+
+    # 场景达标判断
+    preset_result = None
+    if scene and scene in SCENE_PRESETS:
+        preset_result = evaluate_against_preset(aggregates, scene)
+
+    # Baseline 对比
+    baseline_compare = None
+    if baseline:
+        baseline_compare = compare_with_baseline(aggregates, baseline)
+
+    # 综合信号灯
+    if preset_result:
+        preset_result["signal"] = determine_signal(preset_result, baseline_compare)
+
+    # 雷达图
+    radar_html = _render_radar(aggregates, baseline=baseline if baseline else None)
+
+    # 改进建议
+    suggestions = _generate_suggestions(aggregates, preset_result)
+    suggestion_html = "<ul>" + "".join(f"<li>{s}</li>" for s in suggestions) + "</ul>"
+
+    # 总览表
+    agg_rows = ""
+    for m in METRICS:
+        v = aggregates.get(m)
+        vs = f"{v:.3f}" if v is not None else "N/A"
+        tag = "-"
+        if preset_result:
+            d = preset_result["details"].get(m, {})
+            tag = {"critical": "关键", "reference": "参考"}.get(d.get("level", ""), "-")
+        agg_rows += f"<tr><td>{METRIC_LABELS[m]} ({m.upper()})</td><td>{vs}</td><td>{tag}</td></tr>"
+
+    # 逐条明细
+    detail_rows = ""
+    low_conf_count = 0
+    for i, r in enumerate(results):
+        qid = r.sample.metadata.get("qid", f"q{i}")
+        q = r.sample.question
+        cat = r.sample.metadata.get("category", "-")
+        if r.confidence == "low":
+            low_conf_count += 1
+        conf_badge = '<span style="color:#d9534f;font-weight:bold;">LOW</span>' if r.confidence == "low" else "high"
+
+        score_cells = ""
+        for m in METRICS:
+            v = r.scores.get(m)
+            if v is None:
+                score_cells += "<td>-</td>"
+            else:
+                color = "#d4edda" if v >= 0.8 else ("#fff3cd" if v >= 0.5 else "#f8d7da")
+                score_cells += f'<td style="background:{color};">{v:.2f}</td>'
+
+        reasoning_bits = []
+        for m in METRICS:
+            d = r.details.get(m, {})
+            if not isinstance(d, dict):
+                continue
+            if d.get("reasoning"):
+                reasoning_bits.append(f"<b>{m.upper()}</b>: {str(d['reasoning'])[:150]}")
+            elif d.get("reason"):
+                reasoning_bits.append(f"<b>{m.upper()}</b>: {str(d['reason'])[:150]}")
+        reasoning_html = "<br>".join(reasoning_bits)
+
+        detail_rows += f"""<tr>
+          <td>{qid}</td><td><div style='max-width:300px;'>{q}</div></td><td>{cat}</td>
+          {score_cells}
+          <td>{conf_badge}</td>
+          <td><div style='max-width:400px;font-size:0.85em;'>{reasoning_html}</div></td>
+        </tr>"""
+
+    # 组装 HTML
+    header_info = f"样本数: {len(results)} | Low-confidence: {low_conf_count}"
+    if scene:
+        header_info += f" | 场景: {SCENE_PRESETS[scene]['name']}"
+    if baseline:
+        header_info += " | 已对比 naive baseline"
+
+    scene_block = _render_scene_block(preset_result) if preset_result else ""
+    baseline_block = _render_baseline_block(baseline_compare) if baseline_compare else ""
+
+    html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>{title}</title>
+<style>
+body {{ font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", Arial, sans-serif; max-width: 1400px; margin: 20px auto; padding: 0 20px; color: #333; }}
+h1, h2 {{ color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 8px; }}
+table {{ border-collapse: collapse; width: 100%; margin: 12px 0; }}
+th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+th {{ background: #3498db; color: white; }}
+tr:nth-child(even) {{ background: #f9f9f9; }}
+.summary-box {{ background: #ecf0f1; padding: 16px; border-radius: 6px; margin: 12px 0; }}
+.suggestion {{ background: #fff3cd; padding: 12px; border-left: 4px solid #ffc107; margin: 12px 0; }}
+</style>
+</head>
+<body>
+<h1>{title}</h1>
+<p>{header_info}</p>
+
+{scene_block}
+
+<h2>一、总览（5 维雷达图）</h2>
+<div style="display:flex;align-items:center;gap:40px;flex-wrap:wrap;">
+  <div>{radar_html}</div>
+  <div>
+    <table>
+      <tr><th>指标</th><th>平均分</th><th>角色</th></tr>
+      {agg_rows}
+    </table>
+  </div>
+</div>
+
+<h2>二、改进建议</h2>
+<div class="suggestion">{suggestion_html}</div>
+
+{baseline_block}
+
+<h2>四、逐条评测详情</h2>
+<p style="font-size:0.9em;color:#666;">单元格颜色：绿色 ≥0.8，黄色 ≥0.5，红色 &lt;0.5。LOW 置信度 = 双 judge 评分差异过大。</p>
+<table>
+<thead>
+<tr>
+  <th>QID</th><th>问题</th><th>类别</th>
+  <th>KBC</th><th>RA</th><th>CT</th><th>NCP</th><th>AC</th>
+  <th>置信</th><th>Reasoning</th>
+</tr>
+</thead>
+<tbody>
+{detail_rows}
+</tbody>
+</table>
+
+<hr>
+<p style="color:#666;font-size:0.85em;">由 <b>nrageval</b> v0.1 生成 · 来源合法性优先于答案正确性</p>
+</body>
+</html>
+"""
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return output_path

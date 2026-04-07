@@ -1,0 +1,50 @@
+"""Knowledge Boundary Compliance (KBC) — 知识边界合规性"""
+from ..judge.base import BaseJudge
+from ..schemas import EvalSample
+from ..claim.extractor import extract_claims
+
+
+def evaluate_kbc(sample: EvalSample, judge: BaseJudge) -> dict:
+    """
+    评估 KBC:
+    1. 将 response 拆为 claims
+    2. 对每条 claim 逐条判断是否被 contexts 严格支持（无推断、无时间敏感外加）
+    3. KBC = 1 - violation_count / total_claims
+    """
+    claims = extract_claims(sample.answer, judge)
+    if not claims:
+        return {
+            "score": None,
+            "total_claims": 0,
+            "violations": 0,
+            "claim_details": [],
+            "note": "回答为空或 claim 提取失败",
+        }
+
+    prompt_template = BaseJudge.load_prompt("kbc_rubric")
+    ctx_text = "\n---\n".join(f"[{i+1}] {c}" for i, c in enumerate(sample.contexts))
+
+    claim_details = []
+    violation_count = 0
+    for claim in claims:
+        prompt = prompt_template.replace("{contexts}", ctx_text).replace("{claim}", claim)
+        result = judge.call_json(prompt)
+        status = result.get("status", "unknown") if isinstance(result, dict) else "unknown"
+        if status == "boundary_violation":
+            violation_count += 1
+        claim_details.append({
+            "claim": claim,
+            "status": status,
+            "reasoning": result.get("reasoning", "") if isinstance(result, dict) else "",
+            "evidence": result.get("evidence", "") if isinstance(result, dict) else "",
+        })
+
+    total = len(claims)
+    score = round(1 - violation_count / total, 4) if total > 0 else None
+
+    return {
+        "score": score,
+        "total_claims": total,
+        "violations": violation_count,
+        "claim_details": claim_details,
+    }

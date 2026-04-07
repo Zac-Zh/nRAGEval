@@ -1,0 +1,80 @@
+"""Refusal Appropriateness (RA) — 拒答合理性"""
+import re
+from ..judge.base import BaseJudge
+from ..schemas import EvalSample
+
+
+# 中文拒答关键词（基于阶段一数据）
+REFUSAL_MARKERS = [
+    "未提及", "未涉及", "无法确定", "知识库中没有", "未找到相关",
+    "未找到", "未说明", "未列出", "未在文档中", "不清楚", "无具体",
+    "没有具体", "未提供", "文档中没有", "文档未", "条例未", "未指出",
+    "没有明确", "未明确说明",
+    # 补充（来自阶段一 doc1_q09 的实际回答）
+    "没有提及", "没有提供", "没有列出", "没有提到", "没有涉及",
+    "没有说明", "未给出", "未包含", "没有相关", "无相关信息",
+    "文档中未", "文档中没", "资料中未", "资料中没",
+]
+
+# 越界信号（不视为拒答）
+BOUNDARY_MARKERS = [
+    "根据我的了解", "一般来说", "通常情况下", "据我所知", "据悉",
+    "根据常识", "一般而言",
+]
+
+
+def detect_refusal(answer: str) -> dict:
+    """基于关键词规则检测 response 是否为拒答"""
+    has_refusal = any(m in answer for m in REFUSAL_MARKERS)
+    has_boundary_signal = any(m in answer for m in BOUNDARY_MARKERS)
+    # 如果同时含拒答关键词和回答内容（长度 > 50 字），判断是"部分拒答"，仍算合理拒答
+    return {
+        "is_refusal": has_refusal,
+        "has_boundary_signal": has_boundary_signal,
+        "matched_markers": [m for m in REFUSAL_MARKERS if m in answer],
+    }
+
+
+def evaluate_ra(sample: EvalSample, judge: BaseJudge) -> dict:
+    """
+    评估 RA:
+    1. 用 judge 判断 contexts 是否充分
+    2. 用规则检测 response 是否拒答
+    3. 交叉判断：
+       insufficient + refusal → 1.0
+       insufficient + no refusal → 0.0
+       sufficient + refusal → 0.0 (过度拒答)
+       sufficient + no refusal → 1.0
+    """
+    # 1. Judge 判断信息充分性
+    prompt_template = BaseJudge.load_prompt("ra_rubric")
+    ctx_text = "\n---\n".join(f"[{i+1}] {c}" for i, c in enumerate(sample.contexts))
+    prompt = prompt_template.replace("{question}", sample.question).replace("{contexts}", ctx_text)
+    sufficiency = judge.call_json(prompt)
+    status = sufficiency.get("status", "unknown") if isinstance(sufficiency, dict) else "unknown"
+
+    # 2. 规则检测拒答
+    refusal_info = detect_refusal(sample.answer)
+    is_refusal = refusal_info["is_refusal"]
+
+    # 3. 交叉判断
+    if status == "insufficient":
+        score = 1.0 if is_refusal else 0.0
+        reason = "信息不充分 + 拒答" if is_refusal else "信息不充分但未拒答（冒答）"
+    elif status == "sufficient":
+        score = 0.0 if is_refusal else 1.0
+        reason = "信息充分但拒答（过度拒答）" if is_refusal else "信息充分 + 正常回答"
+    else:
+        score = None
+        reason = f"judge 判断失败 (status={status})"
+
+    return {
+        "score": score,
+        "information_sufficient": status,
+        "is_refusal": is_refusal,
+        "matched_refusal_markers": refusal_info["matched_markers"],
+        "has_boundary_signal": refusal_info["has_boundary_signal"],
+        "judge_reasoning": sufficiency.get("reasoning", "") if isinstance(sufficiency, dict) else "",
+        "missing_points": sufficiency.get("missing_points", []) if isinstance(sufficiency, dict) else [],
+        "reason": reason,
+    }

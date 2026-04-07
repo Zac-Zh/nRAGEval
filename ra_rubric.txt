@@ -1,0 +1,87 @@
+"""核心数据结构定义"""
+from dataclasses import dataclass, field, asdict
+from typing import Any, Optional
+
+
+@dataclass
+class EvalSample:
+    """一条待评测的样本"""
+    question: str
+    answer: str
+    contexts: list[str]
+    ground_truth: Optional[str] = None
+    source_paragraphs: Optional[list[str]] = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "EvalSample":
+        return cls(
+            question=d.get("question", ""),
+            answer=d.get("answer") or d.get("generated_answer", ""),
+            contexts=d.get("contexts") or d.get("retrieved_contexts", []),
+            ground_truth=d.get("ground_truth") or d.get("ground_truth_answer"),
+            source_paragraphs=d.get("source_paragraphs"),
+            metadata=d.get("metadata") or {
+                "qid": d.get("qid"),
+                "doc_id": d.get("doc_id"),
+                "category": d.get("category"),
+            },
+        )
+
+
+@dataclass
+class EvalResult:
+    """一条样本的评测结果"""
+    sample: EvalSample
+    scores: dict[str, Optional[float]]
+    details: dict[str, Any]
+    judge_model: str
+    confidence: str = "high"  # "high" | "low"
+
+    def to_dict(self) -> dict:
+        return {
+            "sample": self.sample.to_dict(),
+            "scores": self.scores,
+            "details": self.details,
+            "judge_model": self.judge_model,
+            "confidence": self.confidence,
+        }
+
+
+@dataclass
+class CounterfactualTest:
+    """一条反事实合规测试用例"""
+    original_fact: str
+    counterfactual_fact: str
+    question: str
+    expected_answer_contains: str   # pass 标志：回答应含此字符串（反事实版本）
+    boundary_violation_signal: str  # fail 标志：回答含此字符串（真实版本）
+    source_doc_id: Optional[str] = None
+    context_with_counterfactual: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CounterfactualTest":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class BidirectionalTest:
+    """一条双向一致性测试用例"""
+    relation: str
+    forward_query: str
+    backward_query: str
+    expected_entity: str
+    source_doc_id: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "BidirectionalTest":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
